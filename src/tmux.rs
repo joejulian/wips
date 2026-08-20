@@ -335,13 +335,7 @@ impl Tmux {
             pane_id,
             "#{window_id}\t#{@wips_tab_id}",
         ])?;
-        let text =
-            String::from_utf8(output.stdout).context("tmux returned non-UTF-8 identifiers")?;
-        let (window_id, tab_id) = text
-            .trim_end()
-            .split_once('\t')
-            .context("tmux did not return a window and tab identifier")?;
-        Ok((window_id.to_owned(), tab_id.to_owned()))
+        parse_current_ids(&output.stdout)
     }
 
     pub(crate) fn attach(&self) -> Result<()> {
@@ -439,10 +433,19 @@ impl Tmux {
     }
 }
 
+fn parse_current_ids(bytes: &[u8]) -> Result<(String, String)> {
+    let text = std::str::from_utf8(bytes).context("tmux returned non-UTF-8 identifiers")?;
+    let (window_id, tab_id) = text
+        .trim_end_matches(['\n', '\r'])
+        .split_once('\t')
+        .context("tmux did not return a window and tab identifier")?;
+    Ok((window_id.to_owned(), tab_id.to_owned()))
+}
+
 fn parse_created_pane(bytes: &[u8]) -> Result<CreatedPane> {
     let text = std::str::from_utf8(bytes).context("tmux returned non-UTF-8 identifiers")?;
     let (window_id, pane_id) = text
-        .trim_end()
+        .trim_end_matches(['\n', '\r'])
         .split_once('\t')
         .context("tmux did not return a window and pane identifier")?;
     Ok(CreatedPane {
@@ -519,7 +522,25 @@ fn stderr_text(output: &Output) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_created_pane, parse_panes, parse_windows};
+    use super::{parse_created_pane, parse_current_ids, parse_panes, parse_windows};
+
+    #[test]
+    fn parses_current_ids_for_a_freshly_created_untagged_window() {
+        // A brand-new window has no @wips_tab_id yet, so tmux reports it as
+        // empty: "window_id\t\n". trim_end() previously stripped that
+        // trailing tab along with the newline, leaving no '\t' to split on
+        // and breaking `prefix c` for every first-time tab creation.
+        let (window_id, tab_id) = parse_current_ids(b"@29\t\n").expect("parse current ids");
+        assert_eq!(window_id, "@29");
+        assert_eq!(tab_id, "");
+    }
+
+    #[test]
+    fn parses_current_ids_for_an_already_tagged_window() {
+        let (window_id, tab_id) = parse_current_ids(b"@4\ttab-a\n").expect("parse current ids");
+        assert_eq!(window_id, "@4");
+        assert_eq!(tab_id, "tab-a");
+    }
 
     #[test]
     fn parses_created_pane() {
