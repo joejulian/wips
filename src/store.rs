@@ -157,8 +157,8 @@ impl Store {
                 r"
                 INSERT INTO sessions (
                     id, tab_id, position, agent, agent_session_id, cwd, title,
-                    workflow_state, runtime_state, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', 'creating', ?8, ?8)
+                    provider_ready, workflow_state, runtime_state, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', 'creating', ?9, ?9)
                 ",
                 params![
                     session.id,
@@ -168,6 +168,7 @@ impl Store {
                     session.agent_session_id,
                     cwd,
                     session.title,
+                    session.provider_ready,
                     now,
                 ],
             )
@@ -957,6 +958,7 @@ mod tests {
             agent_session_id: None,
             cwd: PathBuf::from(format!("/work/{id}")),
             title: "Starting".to_owned(),
+            provider_ready: false,
         }
     }
 
@@ -969,6 +971,25 @@ mod tests {
         store.create_session(&new_session("session", "tab", 0))?;
         let session = store.get_session("session")?.context("missing session")?;
         assert!(!session.provider_ready);
+        Ok(())
+    }
+
+    #[test]
+    fn adopting_a_previous_provider_session_is_stored_ready_to_resume() -> Result<()> {
+        let (_directory, store) = store()?;
+
+        store.create_or_update_tab("tab", 0, "Work")?;
+        store.create_session(&NewSession {
+            agent_session_id: Some("f9b8c7d6-1111-4222-8333-444455556666".to_owned()),
+            provider_ready: true,
+            ..new_session("session", "tab", 0)
+        })?;
+        let session = store.get_session("session")?.context("missing session")?;
+        assert!(session.provider_ready);
+        assert_eq!(
+            session.agent_session_id.as_deref(),
+            Some("f9b8c7d6-1111-4222-8333-444455556666")
+        );
         Ok(())
     }
 

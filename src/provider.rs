@@ -233,7 +233,7 @@ fn required_session_id(session: &Session, kind: AgentKind) -> Result<&str, Provi
         })
 }
 
-fn validate_claude_session_id(session_id: &str) -> Result<(), ProviderError> {
+pub(crate) fn validate_claude_session_id(session_id: &str) -> Result<(), ProviderError> {
     Uuid::parse_str(session_id).map(|_| ()).map_err(|source| {
         ProviderError::InvalidClaudeSessionId {
             id: session_id.to_owned(),

@@ -92,6 +92,10 @@ pub(crate) struct NewSession {
     pub(crate) agent_session_id: Option<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) title: String,
+    /// True when `agent_session_id` already names a session the provider
+    /// knows about (adopting a previous session), so it should launch via
+    /// resume instead of the normal new-session flow.
+    pub(crate) provider_ready: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
