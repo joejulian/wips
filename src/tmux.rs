@@ -359,21 +359,34 @@ impl Tmux {
         width: &str,
         height: &str,
     ) -> Result<()> {
-        let mut command = vec![
+        let executable = self
+            .executable
+            .to_str()
+            .context("WIPS executable path is not valid UTF-8")?;
+        let mut popup = vec![
+            String::from("tmux"),
+            String::from("display-popup"),
+            String::from("-E"),
+            String::from("-w"),
+            shell_quote(width),
+            String::from("-h"),
+            shell_quote(height),
+            String::from("-T"),
+            shell_quote(title),
+            shell_quote(executable),
+        ];
+        popup.extend(args.into_iter().map(shell_quote_popup_argument));
+
+        // `display-popup` does not expand format strings in the command's
+        // arguments. Run it through tmux's shell command instead; run-shell
+        // expands the binding context first, preserving the originating pane
+        // or window ID for the popup command.
+        self.run([
             OsString::from("bind-key"),
             key.into(),
-            OsString::from("display-popup"),
-            OsString::from("-E"),
-            OsString::from("-w"),
-            width.into(),
-            OsString::from("-h"),
-            height.into(),
-            OsString::from("-T"),
-            title.into(),
-            self.executable.as_os_str().to_owned(),
-        ];
-        command.extend(args.into_iter().map(OsString::from));
-        self.run(command)
+            OsString::from("run-shell"),
+            popup.join(" ").into(),
+        ])
     }
 
     fn tag_window(&self, window_id: &str, tab_id: &str) -> Result<()> {
@@ -520,9 +533,41 @@ fn stderr_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_owned()
 }
 
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::from("'");
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn shell_quote_popup_argument(value: &str) -> String {
+    if matches!(value, "#{pane_id}" | "#{window_id}") {
+        format!("'{value}'")
+    } else {
+        shell_quote(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_created_pane, parse_current_ids, parse_panes, parse_windows};
+    use super::{
+        parse_created_pane, parse_current_ids, parse_panes, parse_windows, shell_quote,
+        shell_quote_popup_argument,
+    };
+
+    #[test]
+    fn shell_quotes_popup_command_values() {
+        assert_eq!(shell_quote("plain value"), "'plain value'");
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote_popup_argument("#{pane_id}"), "'#{pane_id}'");
+        assert_eq!(shell_quote_popup_argument("close"), "'close'");
+    }
 
     #[test]
     fn parses_current_ids_for_a_freshly_created_untagged_window() {

@@ -9,7 +9,7 @@ env:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: wips-rust
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
