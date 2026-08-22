@@ -9,6 +9,8 @@ env:
 
 jobs:
   checks:
+    # This runner image provides Node for JavaScript actions; the next step
+    # installs the exact Rust toolchain used by the project.
     runs-on: wips-rust
     steps:
       - name: Check out repository
