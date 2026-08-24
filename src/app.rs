@@ -801,11 +801,23 @@ fn prompt(label: &str) -> Result<String> {
 }
 
 fn confirm(question: &str) -> Result<bool> {
+    drain_pending_stdin();
     let answer = prompt(&format!("{question} [y/N] "))?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Discard any terminal input already queued before we show a
+/// confirmation prompt. A `display-popup` can inherit a keystroke that
+/// was queued on the pty before the popup's process ever started (e.g.
+/// the key that triggered the binding), which would otherwise be read as
+/// the answer before the user sees the prompt. Not a tty (piped input,
+/// tests) is a no-op, not an error.
+fn drain_pending_stdin() {
+    use nix::sys::termios::{FlushArg, tcflush};
+    let _ = tcflush(io::stdin(), FlushArg::TCIFLUSH);
 }
 
 fn terminal_text(value: &str, limit: usize) -> String {
