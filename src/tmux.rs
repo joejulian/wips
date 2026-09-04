@@ -130,19 +130,15 @@ impl Tmux {
             executable,
             OsStr::new("_create"),
         ])?;
-        self.bind_popup(
+        self.bind_confirm(
             "x",
-            "Complete WIP",
-            ["close", "--confirm", "--pane", "#{pane_id}"],
-            "60",
-            "7",
+            "Mark this WIP complete? (y/n)",
+            ["close", "--pane", "#{pane_id}"],
         )?;
-        self.bind_popup(
+        self.bind_confirm(
             "&",
-            "Complete tab",
-            ["close", "--confirm", "--window", "#{window_id}"],
-            "60",
-            "7",
+            "Mark this tab and every WIP in it complete? (y/n)",
+            ["close", "--window", "#{window_id}"],
         )?;
         self.bind_popup(
             "r",
@@ -389,6 +385,41 @@ impl Tmux {
         ])
     }
 
+    /// Bind `key` to tmux's native confirm-before prompt rather than a
+    /// popup that spawns WIPS to read its own y/N answer. A popup's stdin
+    /// is a fresh pty set up asynchronously after the triggering keystroke;
+    /// that keystroke (or whatever the user typed right after it) can race
+    /// the popup's own read of stdin and get consumed as the answer before
+    /// the user ever sees the prompt, closing it in a flash. confirm-before
+    /// is handled by the tmux client itself as part of the same key-press
+    /// event, so there is no separate process and no race to lose.
+    fn bind_confirm<const N: usize>(&self, key: &str, prompt: &str, args: [&str; N]) -> Result<()> {
+        let mut shell_command = shell_quote(&self.executable.to_string_lossy());
+        for arg in args {
+            shell_command.push(' ');
+            shell_command.push_str(&shell_quote(arg));
+        }
+        // `shell_command` is itself a sequence of single-quoted words (one per
+        // argv element, via shell_quote). tmux's own command-line parser
+        // splits `run-shell`'s trailing text on whitespace/quoting exactly
+        // like a shell would, so without an outer quoting layer each quoted
+        // word becomes a SEPARATE argument to run-shell -- and run-shell only
+        // runs its first argument as the shell-command, treating the rest as
+        // unused `#{1}`/`#{2}`-style substitution values. That silently ran
+        // bare `wips` (its default action) instead of `wips close ...`.
+        // Wrapping the whole thing in double quotes makes tmux hand
+        // run-shell the entire string as one argument, which /bin/sh then
+        // parses correctly via the inner single quotes.
+        self.run([
+            "bind-key",
+            key,
+            "confirm-before",
+            "-p",
+            prompt,
+            &format!("run-shell \"{shell_command}\""),
+        ])
+    }
+
     fn tag_window(&self, window_id: &str, tab_id: &str) -> Result<()> {
         self.run(["set-option", "-w", "-t", window_id, "@wips_tab_id", tab_id])
     }
@@ -529,21 +560,16 @@ fn next_field<'a>(fields: &mut impl Iterator<Item = &'a str>, name: &str) -> Res
         .with_context(|| format!("tmux output is missing {name}"))
 }
 
-fn stderr_text(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).trim().to_owned()
+/// Single-quote `value` for embedding in a POSIX shell command string, the
+/// form `run-shell` expects. tmux expands any `#{...}` format sequences in
+/// the surrounding bind-key argument before this text ever reaches a shell,
+/// so quoting here only has to satisfy the shell, not tmux's own parser.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-fn shell_quote(value: &str) -> String {
-    let mut quoted = String::from("'");
-    for character in value.chars() {
-        if character == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(character);
-        }
-    }
-    quoted.push('\'');
-    quoted
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_owned()
 }
 
 fn shell_quote_popup_argument(value: &str) -> String {
@@ -567,6 +593,12 @@ mod tests {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
         assert_eq!(shell_quote_popup_argument("#{pane_id}"), "'#{pane_id}'");
         assert_eq!(shell_quote_popup_argument("close"), "'close'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_quote("close"), "'close'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]

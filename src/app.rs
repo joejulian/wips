@@ -13,7 +13,8 @@ use crate::hook;
 use crate::model::{NewSession, RuntimeState, Session, Tab, WorkflowState};
 use crate::paths::Paths;
 use crate::provider::{
-    LaunchContext, build_new_command, build_resume_command, write_claude_settings,
+    LaunchContext, build_new_command, build_resume_command, validate_claude_session_id,
+    write_claude_settings,
 };
 use crate::store::Store;
 use crate::tmux::{PaneSnapshot, SplitDirection, Tmux, WindowSnapshot};
@@ -101,6 +102,11 @@ struct NewArgs {
     /// Working directory for the agent.
     #[arg(long)]
     cwd: Option<PathBuf>,
+    /// Adopt a previous agent session by its provider session ID (a Claude
+    /// UUID, or a Codex session ID) instead of starting a new one. The
+    /// session does not need to have been tracked by WIPS before.
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -165,7 +171,11 @@ fn create_from_cli(paths: &Paths, args: &NewArgs) -> Result<u8> {
     Tmux::probe().context("tmux is required to create a WIP")?;
     let cwd = resolve_new_cwd(args.cwd.as_deref())?;
     let agent_name = args.agent.as_deref().unwrap_or(&config.default_agent);
-    config.agent(agent_name)?;
+    let agent = config.agent(agent_name)?;
+    let resume = args.resume.as_deref();
+    if let Some(provider_session_id) = resume {
+        validate_provider_session_id(agent.kind, provider_session_id)?;
+    }
 
     if let Some(split) = args.split {
         ensure_open_workspace(paths, &config, &store, &tmux)?;
@@ -180,7 +190,8 @@ fn create_from_cli(paths: &Paths, args: &NewArgs) -> Result<u8> {
             bail!("target pane {target} is not managed by WIPS");
         }
         let position = next_session_position(&store, &tab_id)?;
-        let session = create_session_record(&store, &config, &tab_id, position, agent_name, cwd)?;
+        let session =
+            create_session_record(&store, &config, &tab_id, position, agent_name, cwd, resume)?;
         let created = tmux.split(
             &target,
             split.into(),
@@ -206,7 +217,7 @@ fn create_from_cli(paths: &Paths, args: &NewArgs) -> Result<u8> {
             tmux_window_id: None,
         };
         store.create_or_update_tab(&tab.id, tab.position, &tab.title)?;
-        let session = create_session_record(&store, &config, &tab_id, 0, agent_name, cwd)?;
+        let session = create_session_record(&store, &config, &tab_id, 0, agent_name, cwd, resume)?;
         let created = if tmux.session_exists()? {
             tmux.new_window(
                 &tab_id,
@@ -254,7 +265,7 @@ fn create_inside_tmux(paths: &Paths, requested_agent: Option<&str>) -> Result<u8
         existing_tab_id
     };
     let position = next_session_position(&store, &tab_id)?;
-    let session = create_session_record(&store, &config, &tab_id, position, agent_name, cwd)?;
+    let session = create_session_record(&store, &config, &tab_id, position, agent_name, cwd, None)?;
     tmux.tag_existing(&window_id, &tab_id, &pane_id, &session.id, &session.title)?;
     store.bind_tab_window(&tab_id, &window_id)?;
     store.bind_session_pane(&session.id, &pane_id)?;
@@ -358,7 +369,7 @@ fn ensure_open_workspace(paths: &Paths, config: &Config, store: &Store, tmux: &T
             tmux_window_id: None,
         };
         store.create_or_update_tab(&tab.id, tab.position, &tab.title)?;
-        create_session_record(store, config, &tab.id, 0, &config.default_agent, cwd)?;
+        create_session_record(store, config, &tab.id, 0, &config.default_agent, cwd, None)?;
         tabs.push(tab);
     }
 
@@ -691,21 +702,41 @@ fn create_session_record(
     position: i64,
     agent_name: &str,
     cwd: PathBuf,
+    resume_provider_session_id: Option<&str>,
 ) -> Result<Session> {
     let agent = config.agent(agent_name)?;
+    let (agent_session_id, provider_ready) = match resume_provider_session_id {
+        Some(provider_session_id) => (Some(provider_session_id.to_owned()), true),
+        None => (
+            (agent.kind == AgentKind::Claude).then(|| Uuid::new_v4().to_string()),
+            false,
+        ),
+    };
     let new_session = NewSession {
         id: Uuid::new_v4().to_string(),
         tab_id: tab_id.to_owned(),
         position,
         agent: agent_name.to_owned(),
-        agent_session_id: (agent.kind == AgentKind::Claude).then(|| Uuid::new_v4().to_string()),
+        agent_session_id,
         title: format!("{agent_name}: {}", tab_title(&cwd)),
         cwd,
+        provider_ready,
     };
     store.create_session(&new_session)?;
     store
         .get_session(&new_session.id)?
         .with_context(|| format!("new session {} was not stored", new_session.id))
+}
+
+fn validate_provider_session_id(kind: AgentKind, provider_session_id: &str) -> Result<()> {
+    if provider_session_id.trim().is_empty() {
+        bail!("--resume needs a provider session ID");
+    }
+    if kind == AgentKind::Claude {
+        validate_claude_session_id(provider_session_id)
+            .context("--resume expects a Claude session UUID")?;
+    }
+    Ok(())
 }
 
 fn next_tab_position(store: &Store) -> Result<i64> {
@@ -770,11 +801,23 @@ fn prompt(label: &str) -> Result<String> {
 }
 
 fn confirm(question: &str) -> Result<bool> {
+    drain_pending_stdin();
     let answer = prompt(&format!("{question} [y/N] "))?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Discard any terminal input already queued before we show a
+/// confirmation prompt. A `display-popup` can inherit a keystroke that
+/// was queued on the pty before the popup's process ever started (e.g.
+/// the key that triggered the binding), which would otherwise be read as
+/// the answer before the user sees the prompt. Not a tty (piped input,
+/// tests) is a no-op, not an error.
+fn drain_pending_stdin() {
+    use nix::sys::termios::{FlushArg, tcflush};
+    let _ = tcflush(io::stdin(), FlushArg::TCIFLUSH);
 }
 
 fn terminal_text(value: &str, limit: usize) -> String {
@@ -823,7 +866,11 @@ fn executable_exists(program: &OsStr) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{SplitArg, SplitDirection, should_start_new, tab_title, terminal_text};
+    use super::{
+        SplitArg, SplitDirection, should_start_new, tab_title, terminal_text,
+        validate_provider_session_id,
+    };
+    use crate::config::AgentKind;
     use crate::model::RuntimeState;
 
     #[test]
@@ -855,5 +902,23 @@ mod tests {
         assert!(should_start_new(RuntimeState::Creating, false));
         assert!(!should_start_new(RuntimeState::Creating, true));
         assert!(!should_start_new(RuntimeState::Running, false));
+    }
+
+    #[test]
+    fn resume_rejects_empty_session_ids_for_any_agent() {
+        assert!(validate_provider_session_id(AgentKind::Claude, "").is_err());
+        assert!(validate_provider_session_id(AgentKind::Claude, "   ").is_err());
+        assert!(validate_provider_session_id(AgentKind::Codex, "").is_err());
+    }
+
+    #[test]
+    fn resume_requires_a_uuid_for_claude_but_not_codex() {
+        assert!(validate_provider_session_id(AgentKind::Claude, "not-a-uuid").is_err());
+        assert!(
+            validate_provider_session_id(AgentKind::Claude, "f9b8c7d6-1111-4222-8333-444455556666")
+                .is_ok()
+        );
+        // Codex session IDs are opaque; WIPS doesn't know their format.
+        assert!(validate_provider_session_id(AgentKind::Codex, "not-a-uuid").is_ok());
     }
 }
