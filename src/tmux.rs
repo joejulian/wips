@@ -84,7 +84,7 @@ impl Tmux {
                 "set-option",
                 "-g",
                 "status-right",
-                "prefix+c new tab  |  prefix+%/\" split  |  prefix+x complete  |  prefix+f search",
+                "prefix+c new tab  |  prefix+%/\" split  |  prefix+, rename  |  prefix+x complete  |  prefix+f search",
             ],
             &["set-window-option", "-g", "remain-on-exit", "on"],
             &["set-window-option", "-g", "automatic-rename", "off"],
@@ -146,6 +146,13 @@ impl Tmux {
             ["resume", "--pane", "#{pane_id}"],
             "60",
             "7",
+        )?;
+        self.bind_popup(
+            ",",
+            "Rename tab",
+            ["rename", "--window", "#{window_id}"],
+            "60",
+            "5",
         )?;
         self.bind_popup("f", "Search WIPS", ["search"], "90%", "80%")?;
 

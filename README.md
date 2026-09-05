@@ -60,6 +60,9 @@ wips search database migration
 # Resume an exited agent in its existing pane.
 wips resume --pane '%3'
 
+# Give a tab a durable title (or omit the title to be prompted).
+wips rename --window '@2' 'database migration'
+
 # Adopt a previous agent session into a new tab or split by its provider
 # session ID (a Claude UUID, or a Codex session ID). The session does not
 # need to have been tracked by WIPS before.
@@ -90,6 +93,7 @@ bindings and adds:
 | `prefix x` | Confirm and complete the current WIP |
 | `prefix &` | Confirm and complete the current tab |
 | `prefix r` | Resume an exited WIP in the current pane |
+| `prefix ,` | Change the current tab's title |
 | `prefix f` | Open local WIP search |
 
 Use the normal `prefix d` to detach without completing anything. WIPS configures

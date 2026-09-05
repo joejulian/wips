@@ -55,6 +55,8 @@ enum Action {
         #[arg(long)]
         pane: String,
     },
+    /// Change a tab's title in tmux and durable WIPS state.
+    Rename(RenameArgs),
     /// Check configuration, storage, tmux, and agent executables.
     Doctor,
     #[command(hide = true)]
@@ -128,6 +130,15 @@ struct CloseArgs {
     confirm: bool,
 }
 
+#[derive(Debug, Args)]
+struct RenameArgs {
+    /// New tab title. With no title, WIPS prompts interactively.
+    title: Option<String>,
+    /// tmux window identifier, such as @1; defaults to the current window.
+    #[arg(long)]
+    window: Option<String>,
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
@@ -140,6 +151,7 @@ pub(crate) fn run() -> Result<u8> {
         Action::Search { query } => search(&paths, &query),
         Action::Close(args) => close(&paths, &args),
         Action::Resume { pane } => resume(&paths, &pane),
+        Action::Rename(args) => rename(&paths, &args),
         Action::Doctor => doctor(&paths),
         Action::Hook => {
             hook::handle(&paths)?;
@@ -569,6 +581,50 @@ fn resume(paths: &Paths, pane_id: &str) -> Result<u8> {
     Ok(0)
 }
 
+fn rename(paths: &Paths, args: &RenameArgs) -> Result<u8> {
+    let (_, store, tmux) = context(paths)?;
+    if !tmux.session_exists()? {
+        bail!("the WIPS tmux session is not running");
+    }
+
+    let window_id = if let Some(window_id) = args.window.as_deref() {
+        window_id.to_owned()
+    } else {
+        let pane_id = env::var("TMUX_PANE")
+            .context("rename needs --window when WIPS is invoked outside tmux")?;
+        tmux.current_ids(&pane_id)?.0
+    };
+    let (windows, _) = tmux.snapshots()?;
+    let window = windows
+        .iter()
+        .find(|window| window.window_id == window_id)
+        .with_context(|| format!("tmux window {window_id} does not exist"))?;
+    if window.tab_id.is_empty() {
+        bail!("tmux window {window_id} is not managed by WIPS");
+    }
+
+    let requested_title = if let Some(title) = args.title.as_deref() {
+        title.to_owned()
+    } else {
+        let title = prompt(&format!(
+            "Tab title [{}]: ",
+            terminal_text(&window.title, 60)
+        ))?;
+        if title.trim().is_empty() {
+            return Ok(0);
+        }
+        title
+    };
+    let title = normalize_tab_title(&requested_title)?;
+
+    // SQLite is the source of truth used to reconstruct a lost tmux server,
+    // so persist the title before applying the corresponding live rename.
+    store.rename_tab(&window.tab_id, &title)?;
+    tmux.set_window_title(&window_id, &title)?;
+    println!("renamed tab {window_id} to {title}");
+    Ok(0)
+}
+
 fn list(paths: &Paths, include_completed: bool) -> Result<u8> {
     let store = Store::open(&paths.database)?;
     let sessions = if include_completed {
@@ -790,6 +846,16 @@ fn tab_title(cwd: &Path) -> String {
     }
 }
 
+fn normalize_tab_title(value: &str) -> Result<String> {
+    if value
+        .chars()
+        .all(|character| character.is_whitespace() || character.is_control())
+    {
+        bail!("tab title cannot be empty");
+    }
+    Ok(terminal_text(value, 60))
+}
+
 fn prompt(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush().context("flush terminal prompt")?;
@@ -867,7 +933,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        SplitArg, SplitDirection, should_start_new, tab_title, terminal_text,
+        SplitArg, SplitDirection, normalize_tab_title, should_start_new, tab_title, terminal_text,
         validate_provider_session_id,
     };
     use crate::config::AgentKind;
@@ -895,6 +961,15 @@ mod tests {
     #[test]
     fn tab_titles_use_the_last_component() {
         assert_eq!(tab_title(Path::new("/work/project")), "project");
+    }
+
+    #[test]
+    fn renamed_tab_titles_are_safe_for_tmux_snapshots() {
+        assert_eq!(
+            normalize_tab_title("  Project\talpha\nnext  ").expect("normalize title"),
+            "Project alpha next"
+        );
+        assert!(normalize_tab_title(" \n\t").is_err());
     }
 
     #[test]

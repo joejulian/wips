@@ -149,6 +149,16 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn rename_tab(&self, id: &str, title: &str) -> Result<()> {
+        let now = now_timestamp()?;
+        let changed = self.connection.execute(
+            "UPDATE tabs SET title = ?1, updated_at = ?2 \
+             WHERE id = ?3 AND workflow_state = 'open'",
+            params![title, now, id],
+        )?;
+        require_one(changed, "open tab", id)
+    }
+
     pub(crate) fn create_session(&self, session: &NewSession) -> Result<()> {
         let now = now_timestamp()?;
         let cwd = encode_path(&session.cwd)?;
@@ -1190,6 +1200,28 @@ mod tests {
             ["one", "two", "three"]
         );
         assert_eq!(store.list_open_sessions_for_tab("first")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_a_tab_preserves_its_runtime_metadata() -> Result<()> {
+        let (_directory, store) = store()?;
+        store.create_or_update_tab("tab", 0, "Old title")?;
+        store.create_session(&new_session("session", "tab", 0))?;
+        store.bind_tab_window("tab", "@4")?;
+        store.update_tab_layout_and_positions(
+            "tab",
+            Some("layout-data"),
+            &[("session".to_owned(), 0)],
+        )?;
+
+        store.rename_tab("tab", "New title")?;
+
+        let tabs = store.list_open_tabs()?;
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].title, "New title");
+        assert_eq!(tabs[0].layout.as_deref(), Some("layout-data"));
+        assert_eq!(tabs[0].tmux_window_id.as_deref(), Some("@4"));
         Ok(())
     }
 
