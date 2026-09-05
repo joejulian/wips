@@ -1,0 +1,4 @@
+interface:
+  display_name: "WIPS"
+  short_description: "Manage durable coding-agent sessions with Wips"
+  default_prompt: "Use $wips to inspect and manage my Wips sessions safely."

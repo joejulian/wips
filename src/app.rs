@@ -57,6 +57,8 @@ enum Action {
     },
     /// Change a tab's title in tmux and durable WIPS state.
     Rename(RenameArgs),
+    /// Send a prompt to a running agent pane.
+    Send(SendArgs),
     /// Check configuration, storage, tmux, and agent executables.
     Doctor,
     #[command(hide = true)]
@@ -139,6 +141,15 @@ struct RenameArgs {
     window: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct SendArgs {
+    /// tmux pane identifier, such as %3.
+    #[arg(long)]
+    pane: String,
+    /// Prompt text to paste and submit to the agent.
+    message: String,
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     let paths = Paths::discover()?;
@@ -152,6 +163,7 @@ pub(crate) fn run() -> Result<u8> {
         Action::Close(args) => close(&paths, &args),
         Action::Resume { pane } => resume(&paths, &pane),
         Action::Rename(args) => rename(&paths, &args),
+        Action::Send(args) => send(&paths, &args),
         Action::Doctor => doctor(&paths),
         Action::Hook => {
             hook::handle(&paths)?;
@@ -625,6 +637,36 @@ fn rename(paths: &Paths, args: &RenameArgs) -> Result<u8> {
     Ok(0)
 }
 
+fn send(paths: &Paths, args: &SendArgs) -> Result<u8> {
+    let (_, store, tmux) = context(paths)?;
+    if !tmux.session_exists()? {
+        bail!("the WIPS tmux session is not running");
+    }
+
+    let session = store
+        .find_session_by_tmux_pane(&args.pane)?
+        .with_context(|| format!("pane {} is not tracked by WIPS", args.pane))?;
+    if session.workflow_state != WorkflowState::Open {
+        bail!("session {} is completed", session.id);
+    }
+    let (_, panes) = tmux.snapshots()?;
+    let pane = panes
+        .iter()
+        .find(|pane| pane.pane_id == args.pane && pane.session_id == session.id)
+        .with_context(|| format!("pane {} is no longer present in tmux", args.pane))?;
+    if pane.dead {
+        bail!(
+            "agent in pane {} has exited; resume it before sending a message",
+            args.pane
+        );
+    }
+
+    let message = validate_outbound_message(&args.message)?;
+    tmux.send_input(&args.pane, message)?;
+    println!("sent message to {} in pane {}", session.agent, args.pane);
+    Ok(0)
+}
+
 fn list(paths: &Paths, include_completed: bool) -> Result<u8> {
     let store = Store::open(&paths.database)?;
     let sessions = if include_completed {
@@ -856,6 +898,13 @@ fn normalize_tab_title(value: &str) -> Result<String> {
     Ok(terminal_text(value, 60))
 }
 
+fn validate_outbound_message(value: &str) -> Result<&str> {
+    if value.trim().is_empty() {
+        bail!("message cannot be empty");
+    }
+    Ok(value)
+}
+
 fn prompt(label: &str) -> Result<String> {
     print!("{label}");
     io::stdout().flush().context("flush terminal prompt")?;
@@ -934,7 +983,7 @@ mod tests {
 
     use super::{
         SplitArg, SplitDirection, normalize_tab_title, should_start_new, tab_title, terminal_text,
-        validate_provider_session_id,
+        validate_outbound_message, validate_provider_session_id,
     };
     use crate::config::AgentKind;
     use crate::model::RuntimeState;
@@ -970,6 +1019,15 @@ mod tests {
             "Project alpha next"
         );
         assert!(normalize_tab_title(" \n\t").is_err());
+    }
+
+    #[test]
+    fn outbound_messages_must_contain_non_whitespace_text() {
+        assert_eq!(
+            validate_outbound_message("review this\ncarefully").expect("valid message"),
+            "review this\ncarefully"
+        );
+        assert!(validate_outbound_message(" \n\t").is_err());
     }
 
     #[test]

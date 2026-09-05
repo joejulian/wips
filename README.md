@@ -63,6 +63,9 @@ wips resume --pane '%3'
 # Give a tab a durable title (or omit the title to be prompted).
 wips rename --window '@2' 'database migration'
 
+# Paste and submit a message to a running Codex or Claude pane.
+wips send --pane '%3' 'Review the failing tests and fix the root cause.'
+
 # Adopt a previous agent session into a new tab or split by its provider
 # session ID (a Claude UUID, or a Codex session ID). The session does not
 # need to have been tracked by WIPS before.
@@ -79,6 +82,11 @@ wips doctor
 
 Pane IDs begin with `%` and window IDs begin with `@`. Quoting them avoids shell
 job-control interpretation.
+
+`wips send` accepts only a tracked, running pane, so a split tab always has an
+explicit recipient. It loads the message through stdin into an isolated tmux
+buffer, uses bracketed paste so multiline prompts remain one input event, and
+then submits the prompt. Prompt text is not placed in the tmux command's argv.
 
 ## tmux keys
 

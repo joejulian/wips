@@ -1,8 +1,10 @@
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, bail};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SplitDirection {
@@ -295,6 +297,36 @@ impl Tmux {
         self.run(["rename-window", "-t", window_id, title])
     }
 
+    pub(crate) fn send_input(&self, pane_id: &str, message: &str) -> Result<()> {
+        // A named buffer keeps simultaneous WIPS sends from overwriting each
+        // other. Loading through stdin also keeps prompt text out of argv and
+        // out of tmux's command parser.
+        let buffer_name = format!("wips-send-{}", Uuid::new_v4().simple());
+        self.checked_output_with_input(
+            ["load-buffer", "-b", &buffer_name, "-"],
+            message.as_bytes(),
+        )?;
+
+        // Bracketed paste makes multiline text one paste event for Codex and
+        // Claude rather than turning embedded newlines into early submits.
+        // tmux's default control-character sanitization remains enabled.
+        let paste_result = self.run([
+            "paste-buffer",
+            "-d",
+            "-p",
+            "-r",
+            "-b",
+            &buffer_name,
+            "-t",
+            pane_id,
+        ]);
+        if paste_result.is_err() {
+            let _ = self.output(["delete-buffer", "-b", &buffer_name]);
+        }
+        paste_result?;
+        self.run(["send-keys", "-t", pane_id, "Enter"])
+    }
+
     pub(crate) fn tag_existing(
         &self,
         window_id: &str,
@@ -459,6 +491,30 @@ impl Tmux {
         S: AsRef<OsStr>,
     {
         let output = self.output(args)?;
+        if !output.status.success() {
+            bail!("tmux command failed: {}", stderr_text(&output));
+        }
+        Ok(output)
+    }
+
+    fn checked_output_with_input<I, S>(&self, args: I, input: &[u8]) -> Result<Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = self
+            .base_command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("run tmux command")?;
+        let mut stdin = child.stdin.take().context("open tmux command stdin")?;
+        let write_result = stdin.write_all(input);
+        drop(stdin);
+        let output = child.wait_with_output().context("wait for tmux command")?;
+        write_result.context("write tmux command input")?;
         if !output.status.success() {
             bail!("tmux command failed: {}", stderr_text(&output));
         }
