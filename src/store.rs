@@ -159,6 +159,52 @@ impl Store {
         require_one(changed, "open tab", id)
     }
 
+    pub(crate) fn rename_single_session_tab(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Option<String>> {
+        let now = now_timestamp()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .context("start automatic tab rename transaction")?;
+        let tab_id = transaction
+            .query_row(
+                r"
+                SELECT s.tab_id
+                FROM sessions s
+                JOIN tabs t ON t.id = s.tab_id
+                WHERE s.id = ?1
+                  AND s.workflow_state = 'open'
+                  AND t.workflow_state = 'open'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM sessions other
+                      WHERE other.tab_id = s.tab_id
+                        AND other.workflow_state = 'open'
+                        AND other.id <> s.id
+                  )
+                ",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .with_context(|| format!("find single-session tab for session {session_id}"))?;
+        if let Some(tab_id) = tab_id.as_deref() {
+            require_update(
+                &transaction,
+                "UPDATE tabs SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, now, tab_id],
+                "tab",
+                tab_id,
+            )?;
+        }
+        transaction
+            .commit()
+            .context("commit automatic tab rename")?;
+        Ok(tab_id)
+    }
+
     pub(crate) fn create_session(&self, session: &NewSession) -> Result<()> {
         let now = now_timestamp()?;
         let cwd = encode_path(&session.cwd)?;
@@ -1222,6 +1268,24 @@ mod tests {
         assert_eq!(tabs[0].title, "New title");
         assert_eq!(tabs[0].layout.as_deref(), Some("layout-data"));
         assert_eq!(tabs[0].tmux_window_id.as_deref(), Some("@4"));
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_rename_requires_exactly_one_open_session() -> Result<()> {
+        let (_directory, store) = store()?;
+        store.create_or_update_tab("tab", 0, "Old title")?;
+        store.create_session(&new_session("first", "tab", 0))?;
+
+        assert_eq!(
+            store.rename_single_session_tab("first", "Codex name")?,
+            Some("tab".to_owned())
+        );
+        assert_eq!(store.list_open_tabs()?[0].title, "Codex name");
+
+        store.create_session(&new_session("second", "tab", 1))?;
+        assert_eq!(store.rename_single_session_tab("first", "Wrong")?, None);
+        assert_eq!(store.list_open_tabs()?[0].title, "Codex name");
         Ok(())
     }
 

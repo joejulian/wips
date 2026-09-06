@@ -88,6 +88,12 @@ explicit recipient. It loads the message through stdin into an isolated tmux
 buffer, uses bracketed paste so multiline prompts remain one input event, and
 then submits the prompt. Prompt text is not placed in the tmux command's argv.
 
+When Codex assigns or changes its user-facing session name, WIPS follows the
+app-server `thread/name/updated` notification and applies that name as the
+durable tmux tab title. Automatic renaming is limited to tabs with exactly one
+open agent session; split tabs keep their explicit shared title so panes cannot
+compete over it. `wips rename` remains available for an explicit title.
+
 ## tmux keys
 
 `prefix` means the tmux prefix, `Ctrl-b` by default. WIPS keeps the normal tmux
@@ -195,6 +201,11 @@ lifecycle events. The hook command is exactly:
 The executable path, logical WIP session ID, and state identifiers are passed
 through environment variables, which keeps the reviewed Codex hook definition
 stable across panes and sessions.
+
+After the `SessionStart` hook supplies Codex's provider session ID, WIPS opens a
+notification-only connection to the shared Codex app-server daemon and resumes
+that thread without loading its turns. The connection watches the canonical
+`thread/name/updated` event; it does not infer a tab title from terminal output.
 
 ### Trusting the Codex hook
 

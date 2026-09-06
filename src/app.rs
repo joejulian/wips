@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
+use crate::codex_name::CodexNameSync;
 use crate::config::{AgentKind, Config};
 use crate::hook;
 use crate::model::{NewSession, RuntimeState, Session, Tab, WorkflowState};
@@ -17,6 +18,7 @@ use crate::provider::{
     write_claude_settings,
 };
 use crate::store::Store;
+use crate::title::{normalize_tab_title, terminal_text};
 use crate::tmux::{PaneSnapshot, SplitDirection, Tmux, WindowSnapshot};
 
 #[derive(Debug, Parser)]
@@ -339,7 +341,8 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
     };
 
     store.bind_session_pane(&session.id, &pane_id)?;
-    make_tmux(&config)?.set_pane_title(&pane_id, &terminal_text(&session.title, 80))?;
+    let tmux = make_tmux(&config)?;
+    tmux.set_pane_title(&pane_id, &terminal_text(&session.title, 80))?;
     let mut command_process = Command::new(&command.program);
     command_process
         .args(&command.args)
@@ -355,7 +358,19 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
         )
     })?;
     store.record_running(&session.id, &pane_id)?;
-    let status = match child.wait() {
+    let name_sync = (agent.kind == AgentKind::Codex).then(|| {
+        CodexNameSync::start(
+            paths.clone(),
+            session.id.clone(),
+            command.program.clone(),
+            tmux,
+        )
+    });
+    let wait_result = child.wait();
+    if let Some(sync) = name_sync {
+        sync.stop();
+    }
+    let status = match wait_result {
         Ok(status) => status,
         Err(error) => {
             store.record_exited(&session.id, None)?;
@@ -888,16 +903,6 @@ fn tab_title(cwd: &Path) -> String {
     }
 }
 
-fn normalize_tab_title(value: &str) -> Result<String> {
-    if value
-        .chars()
-        .all(|character| character.is_whitespace() || character.is_control())
-    {
-        bail!("tab title cannot be empty");
-    }
-    Ok(terminal_text(value, 60))
-}
-
 fn validate_outbound_message(value: &str) -> Result<&str> {
     if value.trim().is_empty() {
         bail!("message cannot be empty");
@@ -933,38 +938,6 @@ fn confirm(question: &str) -> Result<bool> {
 fn drain_pending_stdin() {
     use nix::sys::termios::{FlushArg, tcflush};
     let _ = tcflush(io::stdin(), FlushArg::TCIFLUSH);
-}
-
-fn terminal_text(value: &str, limit: usize) -> String {
-    let mut cleaned = String::new();
-    let mut visible = 0;
-    let mut pending_space = false;
-    for character in value.chars() {
-        if character.is_whitespace() || character.is_control() {
-            pending_space = !cleaned.is_empty();
-            continue;
-        }
-        if pending_space {
-            if visible == limit {
-                cleaned.push('…');
-                break;
-            }
-            cleaned.push(' ');
-            visible += 1;
-            pending_space = false;
-        }
-        if visible == limit {
-            cleaned.push('…');
-            break;
-        }
-        cleaned.push(character);
-        visible += 1;
-    }
-    if cleaned.is_empty() {
-        "-".to_owned()
-    } else {
-        cleaned
-    }
 }
 
 fn executable_exists(program: &OsStr) -> bool {
