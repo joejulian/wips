@@ -37,6 +37,15 @@ pub(crate) struct PaneSnapshot {
     pub(crate) exit_code: Option<i32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunnerSnapshot {
+    pub(crate) pane_id: String,
+    pub(crate) session_id: String,
+    pub(crate) pid: i32,
+    pub(crate) generation: String,
+    pub(crate) dead: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Tmux {
     socket: String,
@@ -373,6 +382,28 @@ impl Tmux {
         parse_current_ids(&output.stdout)
     }
 
+    pub(crate) fn runner_snapshot(&self, pane_id: &str) -> Result<RunnerSnapshot> {
+        let output = self.checked_output([
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_id}\t#{@wips_session_id}\t#{pane_pid}\t#{@wips_runner_generation}\t#{pane_dead}",
+        ])?;
+        parse_runner_snapshot(&output.stdout)
+    }
+
+    pub(crate) fn set_runner_generation(&self, pane_id: &str, generation: &str) -> Result<()> {
+        self.run([
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "@wips_runner_generation",
+            generation,
+        ])
+    }
+
     pub(crate) fn attach(&self) -> Result<()> {
         let status = self
             .base_command()
@@ -549,6 +580,29 @@ fn parse_current_ids(bytes: &[u8]) -> Result<(String, String)> {
     Ok((window_id.to_owned(), tab_id.to_owned()))
 }
 
+fn parse_runner_snapshot(bytes: &[u8]) -> Result<RunnerSnapshot> {
+    let text = std::str::from_utf8(bytes).context("tmux returned non-UTF-8 runner data")?;
+    let mut fields = text.trim_end_matches(['\n', '\r']).splitn(5, '\t');
+    let pane_id = next_field(&mut fields, "pane id")?;
+    let session_id = next_field(&mut fields, "WIPS session id")?;
+    let pid = next_field(&mut fields, "pane PID")?
+        .parse()
+        .context("parse tmux pane PID")?;
+    let generation = next_field(&mut fields, "runner generation")?;
+    let dead = match next_field(&mut fields, "pane state")?.as_str() {
+        "0" => false,
+        "1" => true,
+        value => bail!("unknown tmux pane state {value:?}"),
+    };
+    Ok(RunnerSnapshot {
+        pane_id,
+        session_id,
+        pid,
+        generation,
+        dead,
+    })
+}
+
 fn parse_created_pane(bytes: &[u8]) -> Result<CreatedPane> {
     let text = std::str::from_utf8(bytes).context("tmux returned non-UTF-8 identifiers")?;
     let (window_id, pane_id) = text
@@ -646,8 +700,8 @@ fn shell_quote_popup_argument(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_created_pane, parse_current_ids, parse_panes, parse_windows, shell_quote,
-        shell_quote_popup_argument,
+        parse_created_pane, parse_current_ids, parse_panes, parse_runner_snapshot, parse_windows,
+        shell_quote, shell_quote_popup_argument,
     };
 
     #[test]
@@ -687,6 +741,17 @@ mod tests {
         let got = parse_created_pane(b"@3\t%7\n").expect("parse created pane");
         assert_eq!(got.window_id, "@3");
         assert_eq!(got.pane_id, "%7");
+    }
+
+    #[test]
+    fn parses_runner_snapshot() {
+        let got = parse_runner_snapshot(b"%4\tsession-a\t1234\tv1:1234:abcd\t0\n")
+            .expect("parse runner snapshot");
+        assert_eq!(got.pane_id, "%4");
+        assert_eq!(got.session_id, "session-a");
+        assert_eq!(got.pid, 1234);
+        assert_eq!(got.generation, "v1:1234:abcd");
+        assert!(!got.dead);
     }
 
     #[test]

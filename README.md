@@ -60,6 +60,10 @@ wips search database migration
 # Resume an exited agent in its existing pane.
 wips resume --pane '%3'
 
+# Reload WIPS runners after installing a new binary, keeping agents alive.
+wips reload
+wips reload --pane '%3'
+
 # Give a tab a durable title (or omit the title to be prompted).
 wips rename --window '@2' 'database migration'
 
@@ -88,11 +92,16 @@ explicit recipient. It loads the message through stdin into an isolated tmux
 buffer, uses bracketed paste so multiline prompts remain one input event, and
 then submits the prompt. Prompt text is not placed in the tmux command's argv.
 
-When Codex assigns or changes its user-facing session name, WIPS follows the
-app-server `thread/name/updated` notification and applies that name as the
-durable tmux tab title. Automatic renaming is limited to tabs with exactly one
+When Codex assigns or changes its user-facing session name, WIPS reads that
+name from Codex's local state and applies it as the durable tmux tab title.
+Automatic renaming is limited to tabs with exactly one
 open agent session; split tabs keep their explicit shared title so panes cannot
 compete over it. `wips rename` remains available for an explicit title.
+
+`wips reload` replaces each running WIPS pane runner with the installed WIPS
+binary while keeping the tmux panes and agent processes alive. It checks every
+target before starting; a pane launched by an older WIPS runner without reload
+support must first be resumed with a newer binary after its agent exits.
 
 ## tmux keys
 

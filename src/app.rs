@@ -1,15 +1,24 @@
 use std::env;
 use std::ffi::OsStr;
 use std::io::{self, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::Pid;
+use signal_hook::consts::SIGUSR2;
 use uuid::Uuid;
 
 use crate::codex_name::CodexNameSync;
-use crate::config::{AgentKind, Config};
+use crate::config::{AgentConfig, AgentKind, Config};
 use crate::hook;
 use crate::model::{NewSession, RuntimeState, Session, Tab, WorkflowState};
 use crate::paths::Paths;
@@ -19,7 +28,10 @@ use crate::provider::{
 };
 use crate::store::Store;
 use crate::title::{normalize_tab_title, terminal_text};
-use crate::tmux::{PaneSnapshot, SplitDirection, Tmux, WindowSnapshot};
+use crate::tmux::{PaneSnapshot, RunnerSnapshot, SplitDirection, Tmux, WindowSnapshot};
+
+const RUNNER_POLL_DELAY: Duration = Duration::from_millis(100);
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,6 +69,12 @@ enum Action {
         #[arg(long)]
         pane: String,
     },
+    /// Reload WIPS pane runners without stopping their agents or tmux tabs.
+    Reload {
+        /// Reload only this tmux pane; defaults to all running WIPS panes.
+        #[arg(long)]
+        pane: Option<String>,
+    },
     /// Change a tab's title in tmux and durable WIPS state.
     Rename(RenameArgs),
     /// Send a prompt to a running agent pane.
@@ -69,6 +87,8 @@ enum Action {
     Run {
         #[arg(long)]
         session: String,
+        #[arg(long, hide = true)]
+        adopt_child: Option<i32>,
     },
     #[command(name = "_create", hide = true)]
     Create {
@@ -164,6 +184,7 @@ pub(crate) fn run() -> Result<u8> {
         Action::Search { query } => search(&paths, &query),
         Action::Close(args) => close(&paths, &args),
         Action::Resume { pane } => resume(&paths, &pane),
+        Action::Reload { pane } => reload(&paths, pane.as_deref()),
         Action::Rename(args) => rename(&paths, &args),
         Action::Send(args) => send(&paths, &args),
         Action::Doctor => doctor(&paths),
@@ -171,7 +192,10 @@ pub(crate) fn run() -> Result<u8> {
             hook::handle(&paths)?;
             Ok(0)
         }
-        Action::Run { session } => run_session(&paths, &session),
+        Action::Run {
+            session,
+            adopt_child,
+        } => run_session(&paths, &session, adopt_child),
         Action::Create { agent } => create_inside_tmux(&paths, agent.as_deref()),
         Action::Hold => loop {
             std::thread::park();
@@ -296,10 +320,10 @@ fn create_inside_tmux(paths: &Paths, requested_agent: Option<&str>) -> Result<u8
     store.bind_tab_window(&tab_id, &window_id)?;
     store.bind_session_pane(&session.id, &pane_id)?;
     sync_tmux_state(&store, &tmux)?;
-    run_session(paths, &session.id)
+    run_session(paths, &session.id, None)
 }
 
-fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
+fn run_session(paths: &Paths, logical_session_id: &str, adopt_child: Option<i32>) -> Result<u8> {
     let config = Config::load_or_create(paths)?;
     let store = Store::open(&paths.database)?;
     let session = store
@@ -317,6 +341,63 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
                 .ok_or(env::VarError::NotPresent)
         })
         .context("agent process has no tmux pane identifier")?;
+    let reload_requested = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGUSR2, Arc::clone(&reload_requested))
+        .context("register WIPS runner reload signal")?;
+    let tmux = make_tmux(&config)?;
+
+    let mut child = if let Some(pid) = adopt_child {
+        if pid <= 0 || session.runtime_state != RuntimeState::Running {
+            bail!("cannot adopt a child from a non-running WIP");
+        }
+        if session.tmux_pane_id.as_deref() != Some(&pane_id) {
+            bail!("adopted child does not match the WIP pane");
+        }
+        RunnerChild::Adopted(Pid::from_raw(pid))
+    } else {
+        spawn_agent(paths, &config, &store, &session, agent, &pane_id, &tmux)?
+    };
+    if let Some(code) = child.poll()? {
+        store.record_exited(&session.id, Some(i32::from(code)))?;
+        return Ok(code);
+    }
+    let mut name_sync = (agent.kind == AgentKind::Codex)
+        .then(|| CodexNameSync::start(paths.clone(), session.id.clone(), tmux.clone()));
+    if let Err(error) = tmux.set_runner_generation(&pane_id, &runner_generation(std::process::id()))
+    {
+        eprintln!("wips: could not enable runner reload for pane {pane_id}: {error:#}");
+    }
+    let code = loop {
+        if let Some(code) = child.poll()? {
+            break code;
+        }
+        if reload_requested.swap(false, Ordering::AcqRel) {
+            if let Some(sync) = name_sync.take() {
+                sync.stop();
+            }
+            let error = reexec_runner(logical_session_id, child.pid());
+            eprintln!("wips: runner reload failed: {error}");
+            name_sync = (agent.kind == AgentKind::Codex)
+                .then(|| CodexNameSync::start(paths.clone(), session.id.clone(), tmux.clone()));
+        }
+        std::thread::sleep(RUNNER_POLL_DELAY);
+    };
+    if let Some(sync) = name_sync {
+        sync.stop();
+    }
+    store.record_exited(&session.id, Some(i32::from(code)))?;
+    Ok(code)
+}
+
+fn spawn_agent(
+    paths: &Paths,
+    config: &Config,
+    store: &Store,
+    session: &Session,
+    agent: &AgentConfig,
+    pane_id: &str,
+    tmux: &Tmux,
+) -> Result<RunnerChild> {
     let current_exe = env::current_exe().context("resolve the running WIPS executable")?;
     let claude_settings_path = paths
         .state_dir
@@ -335,14 +416,13 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
     }
     let is_new = should_start_new(session.runtime_state, session.provider_ready);
     let command = if is_new {
-        build_new_command(agent, &session, &launch)?
+        build_new_command(agent, session, &launch)?
     } else {
-        build_resume_command(agent, &session, &launch)?
+        build_resume_command(agent, session, &launch)?
     };
 
-    store.bind_session_pane(&session.id, &pane_id)?;
-    let tmux = make_tmux(&config)?;
-    tmux.set_pane_title(&pane_id, &terminal_text(&session.title, 80))?;
+    store.bind_session_pane(&session.id, pane_id)?;
+    tmux.set_pane_title(pane_id, &terminal_text(&session.title, 80))?;
     let mut command_process = Command::new(&command.program);
     command_process
         .args(&command.args)
@@ -351,36 +431,71 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut child = command_process.spawn().with_context(|| {
+    let child = command_process.spawn().with_context(|| {
         format!(
             "launch agent preset `{}` with program {:?}",
             session.agent, command.program
         )
     })?;
-    store.record_running(&session.id, &pane_id)?;
-    let name_sync = (agent.kind == AgentKind::Codex)
-        .then(|| CodexNameSync::start(paths.clone(), session.id.clone(), tmux));
-    let wait_result = child.wait();
-    if let Some(sync) = name_sync {
-        sync.stop();
-    }
-    let status = match wait_result {
-        Ok(status) => status,
-        Err(error) => {
-            store.record_exited(&session.id, None)?;
-            return Err(error).with_context(|| {
-                format!(
-                    "wait for agent preset `{}` with program {:?}",
-                    session.agent, command.program
-                )
-            });
+    store.record_running(&session.id, pane_id)?;
+    Ok(RunnerChild::Spawned(child))
+}
+
+enum RunnerChild {
+    Spawned(Child),
+    Adopted(Pid),
+}
+
+impl RunnerChild {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Spawned(child) => child.id(),
+            Self::Adopted(pid) => u32::try_from(pid.as_raw()).expect("adopted PID is positive"),
         }
+    }
+
+    fn poll(&mut self) -> Result<Option<u8>> {
+        match self {
+            Self::Spawned(child) => {
+                Ok(child
+                    .try_wait()
+                    .context("check agent process")?
+                    .map(|status| {
+                        status
+                            .code()
+                            .and_then(|code| u8::try_from(code).ok())
+                            .unwrap_or(1)
+                    }))
+            }
+            Self::Adopted(pid) => match waitpid(*pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => Ok(Some(u8::try_from(code).unwrap_or(1))),
+                Ok(WaitStatus::Signaled(..)) => Ok(Some(1)),
+                Ok(_) | Err(Errno::EINTR) => Ok(None),
+                Err(error) => Err(error).context("check adopted agent process"),
+            },
+        }
+    }
+}
+
+fn runner_generation(pid: u32) -> String {
+    format!("v1:{pid}:{}", Uuid::new_v4())
+}
+
+fn reexec_runner(session_id: &str, child_pid: u32) -> io::Error {
+    let Some(arg0) = env::args_os().next() else {
+        return io::Error::other("WIPS runner has no executable argument");
     };
-    store.record_exited(&session.id, status.code())?;
-    Ok(status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1))
+    let executable = PathBuf::from(arg0);
+    if !executable.is_absolute() {
+        return io::Error::other("WIPS runner executable path is not absolute");
+    }
+    Command::new(executable)
+        .arg("_run")
+        .arg("--session")
+        .arg(session_id)
+        .arg("--adopt-child")
+        .arg(child_pid.to_string())
+        .exec()
 }
 
 fn ensure_open_workspace(paths: &Paths, config: &Config, store: &Store, tmux: &Tmux) -> Result<()> {
@@ -600,6 +715,98 @@ fn resume(paths: &Paths, pane_id: &str) -> Result<u8> {
     }
     tmux.respawn(pane_id, &session.id, launch_cwd(paths, &session))?;
     Ok(0)
+}
+
+fn reload(paths: &Paths, requested_pane: Option<&str>) -> Result<u8> {
+    let (_, store, tmux) = context(paths)?;
+    if !tmux.session_exists()? {
+        bail!("the WIPS tmux session is not running");
+    }
+    sync_tmux_state(&store, &tmux)?;
+    let sessions = if let Some(pane_id) = requested_pane {
+        vec![
+            store
+                .find_session_by_tmux_pane(pane_id)?
+                .with_context(|| format!("pane {pane_id} is not tracked by WIPS"))?,
+        ]
+    } else {
+        store
+            .list_open_sessions()?
+            .into_iter()
+            .filter(|session| session.runtime_state == RuntimeState::Running)
+            .collect()
+    };
+    let mut targets = Vec::new();
+    for session in sessions {
+        if session.workflow_state != WorkflowState::Open {
+            bail!("session {} is completed", session.id);
+        }
+        if session.runtime_state != RuntimeState::Running {
+            bail!(
+                "pane {} has no running agent",
+                session.tmux_pane_id.as_deref().unwrap_or("-")
+            );
+        }
+        let pane_id = session
+            .tmux_pane_id
+            .as_deref()
+            .context("running WIP has no pane")?;
+        let snapshot = tmux.runner_snapshot(pane_id)?;
+        if !reloadable_runner(&snapshot, &session.id) {
+            bail!(
+                "pane {pane_id} was started by a WIPS runner without live reload support; resume that pane once with the new WIPS binary"
+            );
+        }
+        targets.push(snapshot);
+    }
+    if targets.is_empty() {
+        println!("No running WIPS panes to reload.");
+        return Ok(0);
+    }
+    for target in targets {
+        let current = tmux.runner_snapshot(&target.pane_id)?;
+        if current != target {
+            bail!(
+                "pane {} changed before reload; no signal sent to it",
+                target.pane_id
+            );
+        }
+        kill(Pid::from_raw(target.pid), Signal::SIGUSR2)
+            .with_context(|| format!("request reload of pane {}", target.pane_id))?;
+        let deadline = Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            let current = tmux.runner_snapshot(&target.pane_id)?;
+            if current.pid != target.pid || current.dead || current.session_id != target.session_id
+            {
+                bail!("pane {} changed while reloading", target.pane_id);
+            }
+            if current.generation != target.generation {
+                if !reloadable_runner(&current, &target.session_id) {
+                    bail!("pane {} reported an invalid reload marker", target.pane_id);
+                }
+                println!("reloaded pane {}", target.pane_id);
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for pane {} to reload", target.pane_id);
+            }
+            std::thread::sleep(RUNNER_POLL_DELAY);
+        }
+    }
+    Ok(0)
+}
+
+fn reloadable_runner(snapshot: &RunnerSnapshot, session_id: &str) -> bool {
+    if snapshot.dead || snapshot.pid <= 0 || snapshot.session_id != session_id {
+        return false;
+    }
+    let mut marker = snapshot.generation.split(':');
+    marker.next() == Some("v1")
+        && marker.next().and_then(|pid| pid.parse::<i32>().ok()) == Some(snapshot.pid)
+        && marker
+            .next()
+            .is_some_and(|generation| Uuid::parse_str(generation).is_ok())
+        && marker.next().is_none()
 }
 
 fn rename(paths: &Paths, args: &RenameArgs) -> Result<u8> {
@@ -949,11 +1156,34 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        SplitArg, SplitDirection, normalize_tab_title, should_start_new, tab_title, terminal_text,
-        validate_outbound_message, validate_provider_session_id,
+        SplitArg, SplitDirection, normalize_tab_title, reloadable_runner, runner_generation,
+        should_start_new, tab_title, terminal_text, validate_outbound_message,
+        validate_provider_session_id,
     };
     use crate::config::AgentKind;
     use crate::model::RuntimeState;
+    use crate::tmux::RunnerSnapshot;
+
+    #[test]
+    fn reload_requires_a_live_matching_runner_marker() {
+        let mut snapshot = RunnerSnapshot {
+            pane_id: "%4".to_owned(),
+            session_id: "session".to_owned(),
+            pid: 1234,
+            generation: runner_generation(1234),
+            dead: false,
+        };
+        assert!(reloadable_runner(&snapshot, "session"));
+        assert!(!reloadable_runner(&snapshot, "other"));
+        snapshot.pid = 1235;
+        assert!(!reloadable_runner(&snapshot, "session"));
+        snapshot.pid = 1234;
+        snapshot.dead = true;
+        assert!(!reloadable_runner(&snapshot, "session"));
+        snapshot.dead = false;
+        snapshot.generation.clear();
+        assert!(!reloadable_runner(&snapshot, "session"));
+    }
 
     #[test]
     fn split_names_match_tmux_geometry() {

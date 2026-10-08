@@ -100,7 +100,7 @@ fn codex_home() -> PathBuf {
 fn latest_state_db(codex_home: &Path) -> Result<PathBuf> {
     std::fs::read_dir(codex_home)
         .with_context(|| format!("read Codex home {}", codex_home.display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
