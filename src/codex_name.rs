@@ -1,26 +1,19 @@
-use std::ffi::{OsStr, OsString};
-use std::io::ErrorKind;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use tungstenite::{Error as WebSocketError, Message, WebSocket, client};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::paths::Paths;
 use crate::store::Store;
 use crate::title::normalize_tab_title;
 use crate::tmux::Tmux;
 
-const RETRY_DELAY: Duration = Duration::from_secs(1);
 const POLL_DELAY: Duration = Duration::from_millis(50);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const NAME_READ_DELAY: Duration = Duration::from_secs(5);
 
 pub(crate) struct CodexNameSync {
     stop: Arc<AtomicBool>,
@@ -28,24 +21,13 @@ pub(crate) struct CodexNameSync {
 }
 
 impl CodexNameSync {
-    pub(crate) fn start(
-        paths: Paths,
-        logical_session_id: String,
-        codex_program: OsString,
-        tmux: Tmux,
-    ) -> Self {
+    pub(crate) fn start(paths: Paths, logical_session_id: String, tmux: Tmux) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name("wips-codex-name".to_owned())
             .spawn(move || {
-                run(
-                    &paths,
-                    &logical_session_id,
-                    &codex_program,
-                    &tmux,
-                    &worker_stop,
-                );
+                run(&paths, &logical_session_id, &tmux, &worker_stop);
             })
             .ok();
         Self { stop, worker }
@@ -69,13 +51,7 @@ impl Drop for CodexNameSync {
     }
 }
 
-fn run(
-    paths: &Paths,
-    logical_session_id: &str,
-    codex_program: &OsStr,
-    tmux: &Tmux,
-    stop: &AtomicBool,
-) {
+fn run(paths: &Paths, logical_session_id: &str, tmux: &Tmux, stop: &AtomicBool) {
     let Ok(store) = Store::open(&paths.database) else {
         return;
     };
@@ -83,18 +59,17 @@ fn run(
         return;
     };
 
+    let codex_home = codex_home();
+    let mut last_synced_name = None;
     while !stopped(stop) {
-        if let Ok(socket_path) = daemon_socket(codex_program) {
-            let _ = observe_names(
-                &store,
-                logical_session_id,
-                &thread_id,
-                &socket_path,
-                tmux,
-                stop,
-            );
+        if let Ok(Some(name)) = read_thread_name(&codex_home, &thread_id) {
+            if last_synced_name.as_deref() != Some(name.as_str())
+                && sync_tab_title(&store, logical_session_id, &name, tmux).is_ok()
+            {
+                last_synced_name = Some(name);
+            }
         }
-        wait_while_running(stop, RETRY_DELAY);
+        wait_while_running(stop, NAME_READ_DELAY);
     }
 }
 
@@ -114,124 +89,46 @@ fn wait_for_thread_id(
     None
 }
 
-#[derive(Deserialize)]
-struct DaemonVersion {
-    status: String,
-    #[serde(rename = "socketPath")]
-    socket_path: Option<PathBuf>,
+fn codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
-fn daemon_socket(codex_program: &OsStr) -> Result<PathBuf> {
-    let output = Command::new(codex_program)
-        .args(["app-server", "daemon", "version"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("inspect the Codex app-server daemon")?;
-    if !output.status.success() {
-        bail!("Codex app-server daemon inspection failed");
-    }
-    let version: DaemonVersion =
-        serde_json::from_slice(&output.stdout).context("parse Codex app-server daemon status")?;
-    if version.status != "running" {
-        bail!("Codex app-server daemon is not running");
-    }
-    version
-        .socket_path
-        .context("Codex app-server daemon did not report its socket path")
+fn latest_state_db(codex_home: &Path) -> Result<PathBuf> {
+    std::fs::read_dir(codex_home)
+        .with_context(|| format!("read Codex home {}", codex_home.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u32>()
+                .ok()?;
+            Some((version, entry.path()))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+        .context("find Codex state database")
 }
 
-fn observe_names(
-    store: &Store,
-    logical_session_id: &str,
-    thread_id: &str,
-    socket_path: &PathBuf,
-    tmux: &Tmux,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("connect to Codex app-server at {}", socket_path.display()))?;
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    let (mut websocket, _) = client("ws://localhost/", stream)
-        .map_err(|error| anyhow::anyhow!("open Codex app-server WebSocket: {error}"))?;
-
-    send_json(
-        &mut websocket,
-        &json!({
-            "method": "initialize",
-            "id": 0,
-            "params": {
-                "clientInfo": {
-                    "name": "wips",
-                    "title": "WIPS",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {"experimentalApi": true}
-            }
-        }),
-    )?;
-    send_json(
-        &mut websocket,
-        &json!({"method": "initialized", "params": {}}),
-    )?;
-    send_json(
-        &mut websocket,
-        &json!({
-            "method": "thread/resume",
-            "id": 1,
-            "params": {"threadId": thread_id, "excludeTurns": true}
-        }),
-    )?;
-    websocket.get_mut().set_nonblocking(true)?;
-
-    while !stopped(stop) {
-        match websocket.read() {
-            Ok(message) => match message {
-                Message::Text(text) => {
-                    if let Ok(message) = serde_json::from_str::<Value>(text.as_ref()) {
-                        if resume_failed(&message) {
-                            bail!("Codex app-server rejected the thread subscription");
-                        }
-                        if let Some(title) = name_update(&message, thread_id) {
-                            sync_tab_title(store, logical_session_id, title, tmux)?;
-                        }
-                    }
-                }
-                Message::Close(_) => return Ok(()),
-                _ => {}
-            },
-            Err(WebSocketError::Io(error))
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
-                wait_while_running(stop, POLL_DELAY);
-            }
-            Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => return Ok(()),
-            Err(error) => return Err(error).context("read Codex app-server notification"),
-        }
-    }
-    Ok(())
-}
-
-fn send_json(websocket: &mut WebSocket<UnixStream>, value: &Value) -> Result<()> {
-    let text = serde_json::to_string(value).context("encode Codex app-server request")?;
-    websocket
-        .send(Message::Text(text.into()))
-        .context("send Codex app-server request")
-}
-
-fn resume_failed(message: &Value) -> bool {
-    message.get("id").and_then(Value::as_i64) == Some(1) && message.get("error").is_some()
-}
-
-fn name_update<'a>(message: &'a Value, expected_thread_id: &str) -> Option<&'a str> {
-    (message.get("method").and_then(Value::as_str) == Some("thread/name/updated"))
-        .then(|| message.get("params"))
-        .flatten()
-        .filter(|params| params.get("threadId").and_then(Value::as_str) == Some(expected_thread_id))
-        .and_then(|params| params.get("threadName"))
-        .and_then(Value::as_str)
-        .filter(|title| !title.is_empty())
+fn read_thread_name(codex_home: &Path, thread_id: &str) -> Result<Option<String>> {
+    let path = latest_state_db(codex_home)?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .context("open Codex state database read-only")?;
+    let name: Option<Option<String>> = connection
+        .query_row(
+            "SELECT name FROM threads WHERE id = ?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("read Codex thread name")?;
+    Ok(name.flatten().filter(|name| !name.is_empty()))
 }
 
 fn sync_tab_title(
@@ -267,36 +164,40 @@ fn stopped(stop: &AtomicBool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use anyhow::Result;
+    use rusqlite::Connection;
 
-    use super::{name_update, resume_failed};
+    use super::read_thread_name;
 
     #[test]
-    fn extracts_only_the_expected_thread_name_notification() {
-        let update = json!({
-            "method": "thread/name/updated",
-            "params": {"threadId": "thread-1", "threadName": "Fix the notifier"}
-        });
-        assert_eq!(name_update(&update, "thread-1"), Some("Fix the notifier"));
-        assert_eq!(name_update(&update, "thread-2"), None);
+    fn reads_only_the_named_thread_from_latest_state_database() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        let old = Connection::open(codex_home.path().join("state_4.sqlite"))?;
+        old.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);")?;
+        old.execute(
+            "INSERT INTO threads (id, name) VALUES ('thread-1', 'Old title')",
+            [],
+        )?;
+
+        let current = Connection::open(codex_home.path().join("state_5.sqlite"))?;
+        current.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT);")?;
+        current.execute(
+            "INSERT INTO threads (id, name) VALUES ('thread-1', 'New title')",
+            [],
+        )?;
+        current.execute(
+            "INSERT INTO threads (id, name) VALUES ('thread-2', NULL)",
+            [],
+        )?;
+        current.execute("INSERT INTO threads (id, name) VALUES ('thread-3', '')", [])?;
+
         assert_eq!(
-            name_update(
-                &json!({
-                    "method": "thread/name/updated",
-                    "params": {"threadId": "thread-1", "threadName": null}
-                }),
-                "thread-1"
-            ),
-            None
+            read_thread_name(codex_home.path(), "thread-1")?,
+            Some("New title".to_owned())
         );
-    }
-
-    #[test]
-    fn detects_a_rejected_subscription() {
-        assert!(resume_failed(&json!({
-            "id": 1,
-            "error": {"code": -1, "message": "not found"}
-        })));
-        assert!(!resume_failed(&json!({"id": 1, "result": {}})));
+        assert_eq!(read_thread_name(codex_home.path(), "thread-2")?, None);
+        assert_eq!(read_thread_name(codex_home.path(), "thread-3")?, None);
+        assert_eq!(read_thread_name(codex_home.path(), "missing")?, None);
+        Ok(())
     }
 }

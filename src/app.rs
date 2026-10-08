@@ -358,14 +358,8 @@ fn run_session(paths: &Paths, logical_session_id: &str) -> Result<u8> {
         )
     })?;
     store.record_running(&session.id, &pane_id)?;
-    let name_sync = (agent.kind == AgentKind::Codex).then(|| {
-        CodexNameSync::start(
-            paths.clone(),
-            session.id.clone(),
-            command.program.clone(),
-            tmux,
-        )
-    });
+    let name_sync = (agent.kind == AgentKind::Codex)
+        .then(|| CodexNameSync::start(paths.clone(), session.id.clone(), tmux));
     let wait_result = child.wait();
     if let Some(sync) = name_sync {
         sync.stop();

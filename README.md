@@ -202,10 +202,10 @@ The executable path, logical WIP session ID, and state identifiers are passed
 through environment variables, which keeps the reviewed Codex hook definition
 stable across panes and sessions.
 
-After the `SessionStart` hook supplies Codex's provider session ID, WIPS opens a
-notification-only connection to the shared Codex app-server daemon and resumes
-that thread without loading its turns. The connection watches the canonical
-`thread/name/updated` event; it does not infer a tab title from terminal output.
+After the `SessionStart` hook supplies Codex's provider session ID, WIPS polls
+the thread's explicit name from Codex's local state database using a read-only
+connection. It does not open the thread in app-server or infer a tab title from
+terminal output.
 
 ### Trusting the Codex hook
 
